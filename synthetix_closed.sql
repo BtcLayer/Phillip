@@ -14,54 +14,7 @@ asset_prices as (
   GROUP BY 1, 2, 3
 ),
 
-tracking_v1_positions as (
-    SELECT evt_tx_hash, fee, sizeDelta
-    FROM synthetix_optimism.FuturesMarket_evt_FuturesTracking
-),
-
-v1_trades as (
-    SELECT positions.evt_block_time, 
-        account as address, 
-        asset_prices.asset as virtual_asset, 
-        tradeSize as size,
-        ABS(tradeSize)/1e18 * asset_prices.price as volume, 
-        (CASE WHEN CAST(positions.tradeSize as double) > 0 THEN 'LONG' WHEN CAST(positions.tradeSize as double) < 0 then 'SHORT' END) as position_side, 
-        (CASE WHEN CAST(positions.margin as double) >= 0 AND CAST(positions.size as double) = 0 AND ABS(CAST(positions.tradeSize as double)) > 0 AND positions.size != positions.tradeSize THEN 'close' ELSE 'open' END) AS position_type, 
-        id, 
-        ROW_NUMBER() OVER (PARTITION BY id, account ORDER BY evt_block_number) as row_num, 
-        POSITIONS.fee/1e18 as fees
-    FROM synthetix_optimism.FuturesMarket_evt_PositionModified as positions
-    Join asset_prices
-        ON positions.contract_address = asset_prices.contract_address
-        AND positions.evt_block_time = asset_prices.time
-    JOIN tracking_v1_positions
-        ON positions.evt_tx_hash = tracking_v1_positions.evt_tx_hash
-        AND positions.fee = tracking_v1_positions.fee
-        AND positions.tradeSize = tracking_v1_positions.sizeDelta
-    WHERE CAST(positions.tradeSize AS DECIMAL) <> 0
-), 
-
-v1_liquidations as (
-    SELECT v1_liquidations.evt_block_time, 
-        account as address, 
-        virtual_asset, 
-        size,
-        abs(v1_liquidations.size/1e18) * price / 1e18 as volume, 
-        IF(v1_liquidations.size/1e18 > 0, 'LONG', 'SHORT') as position_side,
-        'LIQUIDATION' as position_type, 
-        fee/1e18 as fees
-    FROM synthetix_optimism.FuturesMarket_evt_PositionLiquidated as v1_liquidations
-    JOIN (
-        SELECT id, address, virtual_asset
-        FROM v1_trades
-        WHERE row_num = 1
-    ) as all_liquidation_trades
-    ON
-    v1_liquidations.id = all_liquidation_trades.id
-    and v1_liquidations.account = all_liquidation_trades.address
-),
-
-tracking_v2_positions as (
+tracking_positions as (
     SELECT 
         evt_tx_hash, 
         fee, 
@@ -70,11 +23,11 @@ tracking_v2_positions as (
         synthetix_futuresmarket_optimism.ProxyPerpsV2_evt_PerpsTracking 
     ),
 
-v2_trades as (
+trades as (
     SELECT positions.evt_block_time, 
         account as address, 
         asset_prices.asset as virtual_asset, 
-        tradeSize as size,
+        (tradeSize/1e18) * price as sizeDai,
         ABS(tradeSize) / 1e18 * asset_prices.price as volume, 
         (CASE WHEN CAST(positions.tradeSize as double) > 0 THEN 'LONG' WHEN CAST(positions.tradeSize as double) < 0 then 'SHORT' END) as position_side, 
         (CASE WHEN CAST(positions.margin as double) >= 0 AND CAST(positions.size as double) = 0 AND ABS(CAST(positions.tradeSize as double)) > 0 AND positions.size != positions.tradeSize THEN 'close' ELSE 'open' END) AS position_type, 
@@ -90,50 +43,46 @@ v2_trades as (
         synthetix_futuresmarket_optimism.ProxyPerpsV2_evt_PositionModified as positions 
         JOIN asset_prices ON positions.contract_address = asset_prices.contract_address 
     AND positions.evt_block_time = asset_prices.time 
-        JOIN tracking_v2_positions ON positions.evt_tx_hash = tracking_v2_positions.evt_tx_hash 
-    AND positions.fee = tracking_v2_positions.fee 
-    AND positions.tradeSize = tracking_v2_positions.sizeDelta 
+        JOIN tracking_positions ON positions.evt_tx_hash = tracking_positions.evt_tx_hash 
+    AND positions.fee = tracking_positions.fee 
+    AND positions.tradeSize = tracking_positions.sizeDelta 
     WHERE 
         ABS(tradeSize) / 1e18 <> 0
 ), 
 
-v2_liquidations as (
+liquidations as (
   SELECT 
-    v2_liquidations.evt_block_time, 
+    liquidations.evt_block_time, 
     account as trader, 
     virtual_asset, 
-    size,
+    (size/1e18) * (price/1e18) as sizeDai,
     abs(
-      v2_liquidations.size / 1e18
+      liquidations.size / 1e18
     ) * price / 1e18 as volume, 
     IF(
-      v2_liquidations.size / 1e18 > 0, 
+      liquidations.size / 1e18 > 0, 
       'LONG', 'SHORT'
     ) as position_side, 
     'LIQUIDATION' as position_type, 
     fee / 1e18 as fees 
   FROM 
-    synthetix_futuresmarket_optimism.ProxyPerpsV2_evt_PositionLiquidated as v2_liquidations 
+    synthetix_futuresmarket_optimism.ProxyPerpsV2_evt_PositionLiquidated as liquidations 
     JOIN (
       SELECT 
         id, 
         address, 
         virtual_asset 
       FROM 
-        v2_trades 
+        trades 
       where 
         row_num = 1
-    ) as all_liquidation_trades ON v2_liquidations.id = all_liquidation_trades.id 
-    and v2_liquidations.account = all_liquidation_trades.address
+    ) as all_liquidation_trades ON liquidations.id = all_liquidation_trades.id 
+    and liquidations.account = all_liquidation_trades.address
 ),
 
-trades as (SELECT evt_block_time, address, virtual_asset, size, volume, position_side, position_type, fees FROM v1_trades 
+joined_trades as (SELECT evt_block_time, address, virtual_asset, sizeDai, volume, position_side, position_type, fees FROM trades
     UNION ALL 
-    SELECT evt_block_time, address, virtual_asset, size, volume, position_side, position_type, fees FROM v2_trades
-    UNION ALL 
-    SELECT * FROM v1_liquidations
-    UNION ALL 
-    SELECT * FROM v2_liquidations
+    SELECT * FROM liquidations
 ),
 
 pnltrades as (SELECT
@@ -143,19 +92,19 @@ pnltrades as (SELECT
     volume,
     fees as fee,
     case
-        when position_type = 'LIQUIDATION' then -abs(size/1e18)
-        else size / 1e18
+        when position_type = 'LIQUIDATION' then -abs(sizeDai)
+        else sizeDai
     end as pnl,
     case
         when position_type = 'LIQUIDATION' then -100
-        else ((size / 1e18)/volume) * 100
+        else ((sizeDai)/volume) * 100
     end as pnl_percent,
     position_side,
     case   
         when position_type = 'LIQUIDATION' then 'Yes'
         else 'No' 
     end as liquidation
-    FROM trades WHERE position_type = 'close' OR position_type = 'LIQUIDATION'
+    FROM joined_trades WHERE position_type = 'close' OR position_type = 'LIQUIDATION'
 ),
 
 returndata as (SELECT sum(a.volume) as sum_vol, a.address as address from pnltrades a right join pnltrades b on a.address = b.address GROUP BY a.address),
