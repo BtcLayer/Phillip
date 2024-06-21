@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: metadata-{{ include "blockscout-admin.fullname" . }}
+  labels:
+    app.kubernetes.io/name: metadata-{{ include "blockscout-admin.name" . }}-svc
+    {{- include "blockscout-admin.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.metadata.service.type }}
+  ports:
+    - port: {{ .Values.metadata.service.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+    {{- if .Values.config.prometheus.enabled }}
+    - port: {{ .Values.config.prometheus.port }}
+      targetPort: metrics
+      protocol: TCP
+      name: metrics
+    {{- end }}
+  selector:
+    app.kubernetes.io/name: metadata-{{ include "blockscout-admin.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
